@@ -6,8 +6,10 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:market": "tsx watch src/marketServer/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:market": "node dist/marketServer/index.js",
     "lint": "eslint src --ext .ts",
     "lint:fix": "eslint src --ext .ts --fix",
     "test": "vitest run",

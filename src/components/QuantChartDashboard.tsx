@@ -1,29 +1,216 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  TouchSensor,
+  closestCenter,
+  type DragEndEvent,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { ActionType, LineType, dispose, init, type Chart, type Crosshair, type Point } from 'klinecharts';
-import { calculateBollingerBands } from '../quant/bollinger';
-import { calculateSupportResistance } from '../quant/supportResistance';
 import type {
+  BollingerBandPoint,
   Candle,
-  OrderBookLevel,
   OrderBookSnapshot,
   PriceLevel,
   SignalEvent,
-  SignalType,
 } from '../types/market';
 import './QuantChartDashboard.css';
 
-const HISTORICAL_LIMIT = 500;
-const ORDERBOOK_DEPTH = 12;
-const SIGNAL_LIMIT = 16;
 const TARGET_VOLUME_RATIO = 0.24;
 const MAX_VOLUME_PANE_HEIGHT = 160;
 const MIN_VOLUME_PANE_HEIGHT = 72;
 const BOLLINGER_INDICATOR_NAME = 'BOLL';
 const CANDLE_PANE_ID = 'candle_pane';
 const SUPPORT_RESISTANCE_GROUP = 'sr-levels';
+const SUPPORT_LINE_COLOR = 'rgba(103, 236, 182, 0.95)';
+const RESISTANCE_LINE_COLOR = 'rgba(255, 149, 170, 0.95)';
+const MARKET_SNAPSHOT_ENDPOINT = '/api/market/snapshot';
+const MARKET_WS_ENDPOINT = '/ws/market';
 
 type KlineInterval = '1m' | '5m' | '1h' | '4h' | '1d';
 type MarketSymbol = 'BTCUSDC' | 'ETHUSDC';
+type InsightWidgetId = 'bollinger' | 'levels' | 'orderbook' | 'signals';
+
+interface InsightWidgetConfig {
+  id: InsightWidgetId;
+  title: string;
+  cardClassName?: string;
+}
+
+interface SortableInsightCardProps {
+  id: InsightWidgetId;
+  title: string;
+  locked: boolean;
+  cardClassName?: string;
+  children: ReactNode;
+}
+
+const INSIGHT_WIDGET_ORDER_STORAGE_KEY = 'quant-insight-widget-order-v1';
+const INSIGHT_LAYOUT_LOCK_STORAGE_KEY = 'quant-insight-layout-lock-v1';
+const INSIGHT_WIDGET_CONFIGS: InsightWidgetConfig[] = [
+  { id: 'bollinger', title: '布林带快照' },
+  { id: 'levels', title: '关键价位' },
+  { id: 'orderbook', title: '盘口深度', cardClassName: 'orderbook-card' },
+  { id: 'signals', title: '信号流', cardClassName: 'signals-card' },
+];
+const DEFAULT_INSIGHT_WIDGET_ORDER: InsightWidgetId[] = INSIGHT_WIDGET_CONFIGS.map(
+  (widget) => widget.id
+);
+const INSIGHT_WIDGET_ID_SET = new Set<InsightWidgetId>(DEFAULT_INSIGHT_WIDGET_ORDER);
+
+function normalizeInsightWidgetOrder(rawOrder: unknown): InsightWidgetId[] {
+  if (!Array.isArray(rawOrder)) {
+    return [...DEFAULT_INSIGHT_WIDGET_ORDER];
+  }
+
+  const nextOrder: InsightWidgetId[] = [];
+  for (const item of rawOrder) {
+    if (typeof item !== 'string') {
+      continue;
+    }
+
+    const widgetId = item as InsightWidgetId;
+    if (!INSIGHT_WIDGET_ID_SET.has(widgetId) || nextOrder.includes(widgetId)) {
+      continue;
+    }
+
+    nextOrder.push(widgetId);
+  }
+
+  for (const widgetId of DEFAULT_INSIGHT_WIDGET_ORDER) {
+    if (!nextOrder.includes(widgetId)) {
+      nextOrder.push(widgetId);
+    }
+  }
+
+  return nextOrder;
+}
+
+function loadInsightWidgetOrder(): InsightWidgetId[] {
+  if (typeof window === 'undefined') {
+    return [...DEFAULT_INSIGHT_WIDGET_ORDER];
+  }
+
+  try {
+    const stored = window.localStorage.getItem(INSIGHT_WIDGET_ORDER_STORAGE_KEY);
+    if (!stored) {
+      return [...DEFAULT_INSIGHT_WIDGET_ORDER];
+    }
+
+    const parsed = JSON.parse(stored);
+    return normalizeInsightWidgetOrder(parsed);
+  } catch {
+    return [...DEFAULT_INSIGHT_WIDGET_ORDER];
+  }
+}
+
+function loadInsightLayoutLocked(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    return window.localStorage.getItem(INSIGHT_LAYOUT_LOCK_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function SortableInsightCard(props: SortableInsightCardProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: props.id,
+    disabled: props.locked,
+  });
+
+  const classNames = ['panel-card', 'insight-card'];
+  if (props.cardClassName) {
+    classNames.push(props.cardClassName);
+  }
+  if (isDragging) {
+    classNames.push('is-dragging');
+  }
+
+  return (
+    <section
+      ref={setNodeRef}
+      className={classNames.join(' ')}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+    >
+      <div className="panel-card-head">
+        <h2>{props.title}</h2>
+        <button
+          type="button"
+          className="drag-handle"
+          disabled={props.locked}
+          aria-label={`${props.title}拖拽排序`}
+          title={props.locked ? '布局已锁定' : '拖拽排序'}
+          {...attributes}
+          {...listeners}
+        >
+          ⋮⋮
+        </button>
+      </div>
+      {props.children}
+    </section>
+  );
+}
+
+interface IntervalSettings {
+  historyLimit: number;
+  pivotWindow: number;
+  clusterTolerance: number;
+  maxLevelsPerType: number;
+  proximityThresholdRatio: number;
+}
+
+const INTERVAL_SETTINGS: Record<KlineInterval, IntervalSettings> = {
+  '1m': {
+    historyLimit: 1000,
+    pivotWindow: 5,
+    clusterTolerance: 0.0016,
+    maxLevelsPerType: 4,
+    proximityThresholdRatio: 0.0009,
+  },
+  '5m': {
+    historyLimit: 1000,
+    pivotWindow: 3,
+    clusterTolerance: 0.0028,
+    maxLevelsPerType: 4,
+    proximityThresholdRatio: 0.0011,
+  },
+  '1h': {
+    historyLimit: 800,
+    pivotWindow: 3,
+    clusterTolerance: 0.003,
+    maxLevelsPerType: 4,
+    proximityThresholdRatio: 0.0016,
+  },
+  '4h': {
+    historyLimit: 700,
+    pivotWindow: 3,
+    clusterTolerance: 0.0042,
+    maxLevelsPerType: 4,
+    proximityThresholdRatio: 0.0022,
+  },
+  '1d': {
+    historyLimit: 500,
+    pivotWindow: 2,
+    clusterTolerance: 0.006,
+    maxLevelsPerType: 4,
+    proximityThresholdRatio: 0.0032,
+  },
+};
 
 const INTERVAL_OPTIONS: Array<{ value: KlineInterval; label: string }> = [
   { value: '1m', label: '1分' },
@@ -51,20 +238,56 @@ const hoverTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
   minute: '2-digit',
 });
 
-interface BinanceKlinePayload {
-  k?: {
-    t: number;
-    o: string;
-    h: string;
-    l: string;
-    c: string;
-    v: string;
-  };
+interface MarketSnapshot {
+  symbol: string;
+  interval: KlineInterval;
+  candles: Candle[];
+  currentPrice: number | null;
+  latestBand: BollingerBandPoint | null;
+  supportResistanceLevels: PriceLevel[];
+  orderBook: OrderBookSnapshot;
+  signals: SignalEvent[];
 }
 
-interface BinanceDepthPayload {
-  bids?: string[][];
-  asks?: string[][];
+interface MarketKlineUpdate {
+  candle: Candle;
+  currentPrice: number;
+  latestBand: BollingerBandPoint | null;
+  supportResistanceLevels: PriceLevel[];
+  signals: SignalEvent[];
+}
+
+type MarketServerEvent =
+  | {
+      type: 'snapshot';
+      symbol: string;
+      interval: KlineInterval;
+      payload: MarketSnapshot;
+    }
+  | {
+      type: 'kline_update';
+      symbol: string;
+      interval: KlineInterval;
+      payload: MarketKlineUpdate;
+    }
+  | {
+      type: 'depth_update';
+      symbol: string;
+      payload: {
+        orderBook: OrderBookSnapshot;
+      };
+    }
+  | {
+      type: 'error';
+      payload: {
+        message: string;
+      };
+    };
+
+interface MarketClientCommand {
+  type: 'subscribe' | 'unsubscribe';
+  symbol: string;
+  interval: KlineInterval;
 }
 
 interface HoverCandleInfo {
@@ -77,20 +300,7 @@ interface HoverCandleInfo {
   changePercent: number;
 }
 
-function toOrderBookLevels(levels: string[][]): OrderBookLevel[] {
-  return levels.map((level) => {
-    const price = Number.parseFloat(level[0]);
-    const quantity = Number.parseFloat(level[1]);
-
-    return {
-      price,
-      quantity,
-      notional: price * quantity,
-    };
-  });
-}
-
-function upsertCandle(candles: Candle[], candle: Candle): Candle[] {
+function upsertCandle(candles: Candle[], candle: Candle, historyLimit: number): Candle[] {
   if (candles.length === 0) {
     return [candle];
   }
@@ -103,8 +313,8 @@ function upsertCandle(candles: Candle[], candle: Candle): Candle[] {
   }
 
   const next = [...candles, candle];
-  if (next.length > HISTORICAL_LIMIT) {
-    return next.slice(next.length - HISTORICAL_LIMIT);
+  if (historyLimit > 0 && next.length > historyLimit) {
+    return next.slice(next.length - historyLimit);
   }
 
   return next;
@@ -166,23 +376,6 @@ function buildHoverCandleInfo(
   };
 }
 
-function buildSignalEvent(type: SignalType, price: number, timestamp: number): SignalEvent {
-  const descriptions: Record<SignalType, string> = {
-    breakout_up: '价格向上突破布林上轨',
-    breakout_down: '价格向下跌破布林下轨',
-    support_touch: '价格接近支撑位，留意止跌确认',
-    resistance_touch: '价格接近阻力位，留意量能突破',
-  };
-
-  return {
-    id: `${type}-${timestamp}-${Math.round(price * 100)}`,
-    type,
-    price,
-    timestamp,
-    description: descriptions[type],
-  };
-}
-
 function calculateVolumePaneHeight(containerHeight: number): number {
   if (containerHeight <= 0) {
     return 0;
@@ -201,38 +394,26 @@ export default function QuantChartDashboard() {
   const volumePaneIdRef = useRef<string | null>(null);
   const candlesRef = useRef<Candle[]>([]);
   const lastHoverKeyRef = useRef<string | null>(null);
-  const klineWsRef = useRef<WebSocket | null>(null);
-  const depthWsRef = useRef<WebSocket | null>(null);
-  const lastSignalFingerprintRef = useRef<string | null>(null);
+  const marketWsRef = useRef<WebSocket | null>(null);
 
   const [chartReady, setChartReady] = useState(false);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
+  const [latestBand, setLatestBand] = useState<BollingerBandPoint | null>(null);
+  const [supportResistanceLevels, setSupportResistanceLevels] = useState<PriceLevel[]>([]);
   const [orderBook, setOrderBook] = useState<OrderBookSnapshot>({ bids: [], asks: [] });
   const [signals, setSignals] = useState<SignalEvent[]>([]);
   const [hoverCandle, setHoverCandle] = useState<HoverCandleInfo | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<MarketSymbol>('BTCUSDC');
   const [selectedInterval, setSelectedInterval] = useState<KlineInterval>('1m');
+  const [showSupportResistanceLines, setShowSupportResistanceLines] = useState(true);
+  const [insightWidgetOrder, setInsightWidgetOrder] = useState<InsightWidgetId[]>(() =>
+    loadInsightWidgetOrder()
+  );
+  const [insightLayoutLocked, setInsightLayoutLocked] = useState(() => loadInsightLayoutLocked());
 
-  const bollingerSeries = useMemo(() => {
-    return calculateBollingerBands(candles, {
-      period: 20,
-      stdDevMultiplier: 2,
-    });
-  }, [candles]);
-
-  const supportResistanceLevels = useMemo(() => {
-    return calculateSupportResistance(candles, {
-      pivotWindow: 3,
-      clusterTolerance: 0.003,
-      maxLevelsPerType: 4,
-    });
-  }, [candles]);
-
-  const supportLevels = supportResistanceLevels.filter((level) => level.type === 'support');
-  const resistanceLevels = supportResistanceLevels.filter((level) => level.type === 'resistance');
-
-  const latestBand = bollingerSeries.length > 0 ? bollingerSeries[bollingerSeries.length - 1] : null;
+  const intervalSettings = INTERVAL_SETTINGS[selectedInterval];
+  const historyLimit = intervalSettings.historyLimit;
   const previousClose = candles.length > 1 ? candles[candles.length - 2].close : null;
   const livePrice = currentPrice ?? (candles.length > 0 ? candles[candles.length - 1].close : null);
 
@@ -246,9 +427,71 @@ export default function QuantChartDashboard() {
   const selectedSymbolLabel =
     SYMBOL_OPTIONS.find((option) => option.value === selectedSymbol)?.label ?? selectedSymbol;
 
+  const insightWidgetConfigMap = useMemo(() => {
+    return INSIGHT_WIDGET_CONFIGS.reduce<Record<InsightWidgetId, InsightWidgetConfig>>(
+      (accumulator, widget) => {
+        accumulator[widget.id] = widget;
+        return accumulator;
+      },
+      {
+        bollinger: INSIGHT_WIDGET_CONFIGS[0],
+        levels: INSIGHT_WIDGET_CONFIGS[1],
+        orderbook: INSIGHT_WIDGET_CONFIGS[2],
+        signals: INSIGHT_WIDGET_CONFIGS[3],
+      }
+    );
+  }, []);
+
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, {
+      activationConstraint: {
+        distance: 8,
+      },
+    }),
+    useSensor(TouchSensor, {
+      activationConstraint: {
+        delay: 160,
+        tolerance: 6,
+      },
+    }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    })
+  );
+
   useEffect(() => {
     candlesRef.current = candles;
   }, [candles]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(
+        INSIGHT_WIDGET_ORDER_STORAGE_KEY,
+        JSON.stringify(insightWidgetOrder)
+      );
+    } catch {
+      return;
+    }
+  }, [insightWidgetOrder]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(
+        INSIGHT_LAYOUT_LOCK_STORAGE_KEY,
+        insightLayoutLocked ? '1' : '0'
+      );
+    } catch {
+      return;
+    }
+  }, [insightLayoutLocked]);
 
   useEffect(() => {
     if (!chartContainerRef.current) {
@@ -260,11 +503,12 @@ export default function QuantChartDashboard() {
     setCandles([]);
     setSignals([]);
     setCurrentPrice(null);
+    setLatestBand(null);
+    setSupportResistanceLevels([]);
     setOrderBook({ bids: [], asks: [] });
     candlesRef.current = [];
     setHoverCandle(null);
     lastHoverKeyRef.current = null;
-    lastSignalFingerprintRef.current = null;
 
     const chart = init(container, {
       styles: {
@@ -318,6 +562,13 @@ export default function QuantChartDashboard() {
         },
       },
     });
+
+    if (!chart) {
+      chartRef.current = null;
+      setChartReady(false);
+      return;
+    }
+
     chartRef.current = chart;
 
     const handleCrosshairChange = (payload?: unknown) => {
@@ -463,101 +714,122 @@ export default function QuantChartDashboard() {
 
     let mounted = true;
 
-    const connectKlineStream = () => {
-      const socket = new WebSocket(
-        `wss://stream.binance.com:9443/ws/${selectedSymbol.toLowerCase()}@kline_${selectedInterval}`
-      );
-      klineWsRef.current = socket;
+    const applySnapshot = (snapshot: MarketSnapshot) => {
+      if (!mounted) {
+        return;
+      }
+
+      chart.applyNewData(snapshot.candles);
+      candlesRef.current = snapshot.candles;
+      setCandles(snapshot.candles);
+      setCurrentPrice(snapshot.currentPrice);
+      setLatestBand(snapshot.latestBand);
+      setSupportResistanceLevels(snapshot.supportResistanceLevels);
+      setOrderBook(snapshot.orderBook);
+      setSignals(snapshot.signals);
+    };
+
+    const buildMarketWsUrl = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${protocol}//${window.location.host}${MARKET_WS_ENDPOINT}`;
+    };
+
+    const subscribeCommand: MarketClientCommand = {
+      type: 'subscribe',
+      symbol: selectedSymbol,
+      interval: selectedInterval,
+    };
+
+    const unsubscribeCommand: MarketClientCommand = {
+      type: 'unsubscribe',
+      symbol: selectedSymbol,
+      interval: selectedInterval,
+    };
+
+    const connectMarketStream = () => {
+      const socket = new WebSocket(buildMarketWsUrl());
+      marketWsRef.current = socket;
+
+      socket.onopen = () => {
+        socket.send(JSON.stringify(subscribeCommand));
+      };
 
       socket.onmessage = (event) => {
-        const payload = JSON.parse(event.data) as BinanceKlinePayload;
-        if (!payload.k) {
+        let message: MarketServerEvent;
+
+        try {
+          message = JSON.parse(event.data) as MarketServerEvent;
+        } catch {
           return;
         }
 
-        const candle: Candle = {
-          timestamp: payload.k.t,
-          open: Number.parseFloat(payload.k.o),
-          high: Number.parseFloat(payload.k.h),
-          low: Number.parseFloat(payload.k.l),
-          close: Number.parseFloat(payload.k.c),
-          volume: Number.parseFloat(payload.k.v),
-        };
+        if (message.type === 'error') {
+          console.warn('Market service error:', message.payload.message);
+          return;
+        }
 
-        chartRef.current?.updateData(candle);
+        if (message.type === 'depth_update') {
+          if (message.symbol !== selectedSymbol) {
+            return;
+          }
+
+          setOrderBook(message.payload.orderBook);
+          return;
+        }
+
+        if (message.symbol !== selectedSymbol || message.interval !== selectedInterval) {
+          return;
+        }
+
+        if (message.type === 'snapshot') {
+          applySnapshot(message.payload);
+          return;
+        }
+
+        chartRef.current?.updateData(message.payload.candle);
         setCandles((previous) => {
-          const next = upsertCandle(previous, candle);
+          const next = upsertCandle(previous, message.payload.candle, historyLimit);
           candlesRef.current = next;
           return next;
         });
-        setCurrentPrice(candle.close);
+        setCurrentPrice(message.payload.currentPrice);
+        setLatestBand(message.payload.latestBand);
+        setSupportResistanceLevels(message.payload.supportResistanceLevels);
+        setSignals(message.payload.signals);
       };
-    };
 
-    const connectDepthStream = () => {
-      const socket = new WebSocket(
-        `wss://stream.binance.com:9443/ws/${selectedSymbol.toLowerCase()}@depth20@100ms`
-      );
-      depthWsRef.current = socket;
-
-      socket.onmessage = (event) => {
-        const payload = JSON.parse(event.data) as BinanceDepthPayload;
-
-        if (!payload.bids || !payload.asks) {
-          return;
+      return () => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify(unsubscribeCommand));
         }
 
-        const asks = toOrderBookLevels(payload.asks.slice(0, ORDERBOOK_DEPTH)).reverse();
-        const bids = toOrderBookLevels(payload.bids.slice(0, ORDERBOOK_DEPTH));
-
-        setOrderBook({ asks, bids });
+        socket.close();
+        if (marketWsRef.current === socket) {
+          marketWsRef.current = null;
+        }
       };
     };
 
-    const loadInitialCandles = async () => {
+    const disconnectMarketStream = connectMarketStream();
+
+    const loadInitialSnapshot = async () => {
       try {
         const response = await fetch(
-          `https://api.binance.com/api/v3/klines?symbol=${selectedSymbol}&interval=${selectedInterval}&limit=${HISTORICAL_LIMIT}`
+          `${MARKET_SNAPSHOT_ENDPOINT}?symbol=${selectedSymbol}&interval=${selectedInterval}`
         );
 
         if (!response.ok) {
-          throw new Error(`Binance API returned ${response.status}`);
+          throw new Error(`Market server returned ${response.status}`);
         }
 
-        const payload = (await response.json()) as Array<
-          [number, string, string, string, string, string]
-        >;
-
-        if (!mounted) {
-          return;
-        }
-
-        const formatted = payload.map((item) => ({
-          timestamp: item[0],
-          open: Number.parseFloat(item[1]),
-          high: Number.parseFloat(item[2]),
-          low: Number.parseFloat(item[3]),
-          close: Number.parseFloat(item[4]),
-          volume: Number.parseFloat(item[5]),
-        }));
-
-        chart.applyNewData(formatted);
-        candlesRef.current = formatted;
-        setCandles(formatted);
-
-        const last = formatted[formatted.length - 1];
-        if (last) {
-          setCurrentPrice(last.close);
-        }
-
-        connectKlineStream();
-        connectDepthStream();
+        const snapshot = (await response.json()) as MarketSnapshot;
+        applySnapshot(snapshot);
       } catch (error) {
-        console.error('Failed to load Binance historical candles', error);
+        console.error('Failed to load market snapshot', error);
       }
     };
 
-    loadInitialCandles();
+    void loadInitialSnapshot();
 
     const handleResize = () => {
       syncVolumePaneSize();
@@ -574,8 +846,7 @@ export default function QuantChartDashboard() {
       container.removeEventListener('mousemove', handleMouseMove);
       container.removeEventListener('mouseleave', handleMouseLeave);
 
-      klineWsRef.current?.close();
-      depthWsRef.current?.close();
+      disconnectMarketStream();
 
       if (chartContainerRef.current) {
         dispose(chartContainerRef.current);
@@ -587,7 +858,7 @@ export default function QuantChartDashboard() {
       setChartReady(false);
       setHoverCandle(null);
     };
-  }, [selectedInterval, selectedSymbol]);
+  }, [historyLimit, selectedInterval, selectedSymbol]);
 
   useEffect(() => {
     if (!chartReady || !chartRef.current) {
@@ -596,6 +867,10 @@ export default function QuantChartDashboard() {
 
     const chart = chartRef.current;
     chart.removeOverlay({ groupId: SUPPORT_RESISTANCE_GROUP });
+
+    if (!showSupportResistanceLines) {
+      return;
+    }
 
     const lastCandle = candles[candles.length - 1];
     if (!lastCandle) {
@@ -616,7 +891,7 @@ export default function QuantChartDashboard() {
         points: [{ timestamp: lastCandle.timestamp, value: level.price }],
         styles: {
           line: {
-            color: level.type === 'support' ? 'rgba(255, 255, 255, 0.9)' : 'rgba(255, 214, 64, 0.95)',
+            color: level.type === 'support' ? SUPPORT_LINE_COLOR : RESISTANCE_LINE_COLOR,
             size: 1,
             style: LineType.Solid,
             dashedValue: [],
@@ -625,54 +900,156 @@ export default function QuantChartDashboard() {
         },
       }))
     );
-  }, [candles, chartReady, supportResistanceLevels]);
+  }, [candles, chartReady, showSupportResistanceLines, supportResistanceLevels]);
 
-  useEffect(() => {
-    const lastCandle = candles[candles.length - 1];
-    if (!lastCandle) {
+  const handleInsightWidgetDragEnd = (event: DragEndEvent) => {
+    if (insightLayoutLocked) {
       return;
     }
 
-    const threshold = lastCandle.close * 0.0012;
-
-    const nearestSupport = supportLevels
-      .filter((level) => level.price <= lastCandle.close)
-      .sort((left, right) => right.price - left.price)[0];
-
-    const nearestResistance = resistanceLevels
-      .filter((level) => level.price >= lastCandle.close)
-      .sort((left, right) => left.price - right.price)[0];
-
-    let nextSignal: SignalEvent | null = null;
-
-    if (latestBand && lastCandle.close > latestBand.upper) {
-      nextSignal = buildSignalEvent('breakout_up', lastCandle.close, lastCandle.timestamp);
-    } else if (latestBand && lastCandle.close < latestBand.lower) {
-      nextSignal = buildSignalEvent('breakout_down', lastCandle.close, lastCandle.timestamp);
-    } else if (nearestSupport && Math.abs(lastCandle.close - nearestSupport.price) <= threshold) {
-      nextSignal = buildSignalEvent('support_touch', nearestSupport.price, lastCandle.timestamp);
-    } else if (nearestResistance && Math.abs(lastCandle.close - nearestResistance.price) <= threshold) {
-      nextSignal = buildSignalEvent('resistance_touch', nearestResistance.price, lastCandle.timestamp);
-    }
-
-    if (!nextSignal) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) {
       return;
     }
 
-    const fingerprint = `${nextSignal.type}-${Math.round(nextSignal.price * 100)}-${Math.floor(
-      nextSignal.timestamp / 60000
-    )}`;
+    setInsightWidgetOrder((previousOrder) => {
+      const activeId = active.id as InsightWidgetId;
+      const overId = over.id as InsightWidgetId;
+      const oldIndex = previousOrder.indexOf(activeId);
+      const nextIndex = previousOrder.indexOf(overId);
 
-    if (lastSignalFingerprintRef.current === fingerprint) {
-      return;
-    }
+      if (oldIndex < 0 || nextIndex < 0) {
+        return previousOrder;
+      }
 
-    lastSignalFingerprintRef.current = fingerprint;
-
-    setSignals((previous) => {
-      return [nextSignal, ...previous].slice(0, SIGNAL_LIMIT);
+      return arrayMove(previousOrder, oldIndex, nextIndex);
     });
-  }, [candles, latestBand, resistanceLevels, supportLevels]);
+  };
+
+  const handleInsightLayoutReset = () => {
+    setInsightWidgetOrder([...DEFAULT_INSIGHT_WIDGET_ORDER]);
+  };
+
+  const renderInsightWidget = (widgetId: InsightWidgetId) => {
+    const widgetConfig = insightWidgetConfigMap[widgetId];
+    if (!widgetConfig) {
+      return null;
+    }
+
+    if (widgetId === 'bollinger') {
+      return (
+        <SortableInsightCard
+          key={widgetConfig.id}
+          id={widgetConfig.id}
+          title={widgetConfig.title}
+          cardClassName={widgetConfig.cardClassName}
+          locked={insightLayoutLocked}
+        >
+          <div className="metric-grid">
+            <div>
+              <span>上轨</span>
+              <strong>{formatPrice(latestBand?.upper ?? null)}</strong>
+            </div>
+            <div>
+              <span>中轨</span>
+              <strong>{formatPrice(latestBand?.middle ?? null)}</strong>
+            </div>
+            <div>
+              <span>下轨</span>
+              <strong>{formatPrice(latestBand?.lower ?? null)}</strong>
+            </div>
+          </div>
+        </SortableInsightCard>
+      );
+    }
+
+    if (widgetId === 'levels') {
+      return (
+        <SortableInsightCard
+          key={widgetConfig.id}
+          id={widgetConfig.id}
+          title={widgetConfig.title}
+          cardClassName={widgetConfig.cardClassName}
+          locked={insightLayoutLocked}
+        >
+          <div className="level-list">
+            {supportResistanceLevels.length === 0 ? (
+              <p className="empty-hint">历史数据不足，等待形成结构点。</p>
+            ) : (
+              supportResistanceLevels.map((level: PriceLevel) => (
+                <div key={level.id} className={`level-item ${level.type}`}>
+                  <span>{level.type === 'support' ? '支撑' : '阻力'}</span>
+                  <strong>{formatPrice(level.price)}</strong>
+                  <small>{`触发 ${level.touches} 次`}</small>
+                </div>
+              ))
+            )}
+          </div>
+        </SortableInsightCard>
+      );
+    }
+
+    if (widgetId === 'orderbook') {
+      return (
+        <SortableInsightCard
+          key={widgetConfig.id}
+          id={widgetConfig.id}
+          title={widgetConfig.title}
+          cardClassName={widgetConfig.cardClassName}
+          locked={insightLayoutLocked}
+        >
+          <div className="orderbook-head">
+            <span>价格</span>
+            <span>数量</span>
+            <span>名义</span>
+          </div>
+          <div className="orderbook-body">
+            {orderBook.asks.map((item, index) => (
+              <div key={`ask-${index}-${item.price}`} className="order-row ask">
+                <span>{item.price.toFixed(2)}</span>
+                <span>{item.quantity.toFixed(4)}</span>
+                <span>{item.notional.toFixed(0)}</span>
+              </div>
+            ))}
+
+            <div className="order-mid">{formatPrice(livePrice)}</div>
+
+            {orderBook.bids.map((item, index) => (
+              <div key={`bid-${index}-${item.price}`} className="order-row bid">
+                <span>{item.price.toFixed(2)}</span>
+                <span>{item.quantity.toFixed(4)}</span>
+                <span>{item.notional.toFixed(0)}</span>
+              </div>
+            ))}
+          </div>
+        </SortableInsightCard>
+      );
+    }
+
+    return (
+      <SortableInsightCard
+        key={widgetConfig.id}
+        id={widgetConfig.id}
+        title={widgetConfig.title}
+        cardClassName={widgetConfig.cardClassName}
+        locked={insightLayoutLocked}
+      >
+        <div className="signals-list">
+          {signals.length === 0 ? (
+            <p className="empty-hint">暂无触发信号，保持观察。</p>
+          ) : (
+            signals.map((signal) => (
+              <div key={signal.id} className={`signal-item ${signal.type}`}>
+                <span>{timeFormatter.format(signal.timestamp)}</span>
+                <strong>{formatPrice(signal.price)}</strong>
+                <p>{signal.description}</p>
+              </div>
+            ))
+          )}
+        </div>
+      </SortableInsightCard>
+    );
+  };
 
   return (
     <div className="quant-page">
@@ -712,6 +1089,25 @@ export default function QuantChartDashboard() {
               {option.label}
             </button>
           ))}
+          <button
+            type="button"
+            className="sr-toggle"
+            data-visible={showSupportResistanceLines ? 'true' : 'false'}
+            onClick={() => setShowSupportResistanceLines((previous) => !previous)}
+          >
+            {showSupportResistanceLines ? '隐藏结构线' : '显示结构线'}
+          </button>
+          <button
+            type="button"
+            className="layout-lock-toggle"
+            data-locked={insightLayoutLocked ? 'true' : 'false'}
+            onClick={() => setInsightLayoutLocked((previous) => !previous)}
+          >
+            {insightLayoutLocked ? '解锁布局' : '锁定布局'}
+          </button>
+          <button type="button" className="layout-reset" onClick={handleInsightLayoutReset}>
+            重置布局
+          </button>
         </div>
       </header>
 
@@ -759,86 +1155,16 @@ export default function QuantChartDashboard() {
         </article>
 
         <aside className="insight-panel">
-          <section className="panel-card">
-            <h2>布林带快照</h2>
-            <div className="metric-grid">
-              <div>
-                <span>上轨</span>
-                <strong>{formatPrice(latestBand?.upper ?? null)}</strong>
-              </div>
-              <div>
-                <span>中轨</span>
-                <strong>{formatPrice(latestBand?.middle ?? null)}</strong>
-              </div>
-              <div>
-                <span>下轨</span>
-                <strong>{formatPrice(latestBand?.lower ?? null)}</strong>
-              </div>
-            </div>
-          </section>
-
-          <section className="panel-card">
-            <h2>关键价位</h2>
-            <div className="level-list">
-              {supportResistanceLevels.length === 0 ? (
-                <p className="empty-hint">历史数据不足，等待形成结构点。</p>
-              ) : (
-                supportResistanceLevels.map((level: PriceLevel) => (
-                  <div key={level.id} className={`level-item ${level.type}`}>
-                    <span>{level.type === 'support' ? '支撑' : '阻力'}</span>
-                    <strong>{formatPrice(level.price)}</strong>
-                    <small>{`触发 ${level.touches} 次`}</small>
-                  </div>
-                ))
-              )}
-            </div>
-          </section>
-
-          <section className="panel-card orderbook-card">
-            <h2>盘口深度</h2>
-            <div className="orderbook-head">
-              <span>价格</span>
-              <span>数量</span>
-              <span>名义</span>
-            </div>
-            <div className="orderbook-body">
-              {orderBook.asks.map((item, index) => (
-                <div key={`ask-${index}-${item.price}`} className="order-row ask">
-                  <span>{item.price.toFixed(2)}</span>
-                  <span>{item.quantity.toFixed(4)}</span>
-                  <span>{item.notional.toFixed(0)}</span>
-                </div>
-              ))}
-
-              <div className="order-mid">{formatPrice(livePrice)}</div>
-
-              {orderBook.bids.map((item, index) => (
-                <div key={`bid-${index}-${item.price}`} className="order-row bid">
-                  <span>{item.price.toFixed(2)}</span>
-                  <span>{item.quantity.toFixed(4)}</span>
-                  <span>{item.notional.toFixed(0)}</span>
-                </div>
-              ))}
-            </div>
-          </section>
+          <DndContext
+            sensors={dndSensors}
+            collisionDetection={closestCenter}
+            onDragEnd={handleInsightWidgetDragEnd}
+          >
+            <SortableContext items={insightWidgetOrder} strategy={verticalListSortingStrategy}>
+              {insightWidgetOrder.map((widgetId) => renderInsightWidget(widgetId))}
+            </SortableContext>
+          </DndContext>
         </aside>
-      </section>
-
-      <section className="signals-card">
-        <h2>信号流</h2>
-        <div className="signals-list">
-          {signals.length === 0 ? (
-            <p className="empty-hint">暂无触发信号，保持观察。</p>
-          ) : (
-            signals.map((signal) => (
-              <div key={signal.id} className={`signal-item ${signal.type}`}>
-                <span>{timeFormatter.format(signal.timestamp)}</span>
-                <strong>{formatPrice(signal.price)}</strong>
-                <p>{signal.description}</p>
-              </div>
-            ))
-          )}
-        </div>
       </section>
     </div>
   );

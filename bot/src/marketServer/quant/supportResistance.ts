@@ -1,4 +1,4 @@
-import type { Candle, LevelType, PriceLevel } from '../types/market';
+import type { Candle, LevelType, PriceLevel } from '../types.js';
 
 interface SupportResistanceOptions {
   pivotWindow?: number;
@@ -196,6 +196,7 @@ export function calculateSupportResistance(
     if (left.type !== right.type) {
       return left.type === 'support' ? -1 : 1;
     }
+
     return right.strength - left.strength;
   });
 }
