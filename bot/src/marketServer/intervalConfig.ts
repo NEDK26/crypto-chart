@@ -8,6 +8,14 @@ export interface IntervalSettings {
   proximityThresholdRatio: number;
 }
 
+const INTERVAL_TO_MS: Record<KlineInterval, number> = {
+  '1m': 60_000,
+  '5m': 300_000,
+  '1h': 3_600_000,
+  '4h': 14_400_000,
+  '1d': 86_400_000,
+};
+
 export const INTERVAL_SETTINGS: Record<KlineInterval, IntervalSettings> = {
   '1m': {
     historyLimit: 1000,
@@ -71,4 +79,8 @@ export function splitChannelKey(channelKey: string): [string, KlineInterval] | n
   }
 
   return [symbol, interval];
+}
+
+export function getIntervalMs(interval: KlineInterval): number {
+  return INTERVAL_TO_MS[interval];
 }

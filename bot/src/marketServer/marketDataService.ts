@@ -4,6 +4,7 @@ import { marketLogger } from './logger.js';
 import {
   INTERVAL_SETTINGS,
   getChannelKey,
+  getIntervalMs,
   type IntervalSettings,
 } from './intervalConfig.js';
 import { calculateBollingerBands } from './quant/bollinger.js';
@@ -34,6 +35,7 @@ interface MarketChannelState {
   lastSignalFingerprint: string | null;
   refCount: number;
   initialization: Promise<void> | null;
+  historyRefreshPromise: Promise<boolean> | null;
 }
 
 interface SymbolDepthState {
@@ -51,6 +53,12 @@ export interface KlineUpdateEvent {
 export interface DepthUpdateEvent {
   symbol: string;
   payload: MarketDepthUpdatePayload;
+}
+
+export interface SnapshotUpdateEvent {
+  symbol: string;
+  interval: KlineInterval;
+  payload: MarketSnapshot;
 }
 
 export interface MarketDataServiceOptions {
@@ -81,6 +89,23 @@ function upsertCandle(candles: Candle[], candle: Candle, historyLimit: number): 
   }
 
   const lastCandle = candles[candles.length - 1];
+
+  if (candle.timestamp < lastCandle.timestamp) {
+    const existingIndex = candles.findIndex((entry) => entry.timestamp === candle.timestamp);
+    if (existingIndex >= 0) {
+      const next = [...candles];
+      next[existingIndex] = candle;
+      return next;
+    }
+
+    const next = [...candles, candle].sort((left, right) => left.timestamp - right.timestamp);
+    if (historyLimit > 0 && next.length > historyLimit) {
+      return next.slice(next.length - historyLimit);
+    }
+
+    return next;
+  }
+
   if (lastCandle.timestamp === candle.timestamp) {
     const next = [...candles];
     next[next.length - 1] = candle;
@@ -128,6 +153,7 @@ export class MarketDataService extends EventEmitter {
     depthState.refCount += 1;
 
     await this.ensureChannelInitialized(channel);
+    await this.refreshChannelHistory(channel);
     this.ensureKlineSocket(channel);
     this.ensureDepthSocket(normalizedSymbol);
 
@@ -164,6 +190,10 @@ export class MarketDataService extends EventEmitter {
 
   onDepthUpdate(listener: (event: DepthUpdateEvent) => void): void {
     this.on('depth_update', listener);
+  }
+
+  onSnapshotUpdate(listener: (event: SnapshotUpdateEvent) => void): void {
+    this.on('snapshot_update', listener);
   }
 
   close(): void {
@@ -207,6 +237,7 @@ export class MarketDataService extends EventEmitter {
       lastSignalFingerprint: null,
       refCount: 0,
       initialization: null,
+      historyRefreshPromise: null,
     };
     this.channels.set(key, created);
     return created;
@@ -256,6 +287,56 @@ export class MarketDataService extends EventEmitter {
     channel.candles = candles;
     channel.currentPrice = candles[candles.length - 1]?.close ?? null;
     this.recomputeDerivedState(channel, settings);
+  }
+
+  private async refreshChannelHistory(channel: MarketChannelState): Promise<boolean> {
+    if (channel.historyRefreshPromise) {
+      return channel.historyRefreshPromise;
+    }
+
+    channel.historyRefreshPromise = this.doRefreshChannelHistory(channel).finally(() => {
+      channel.historyRefreshPromise = null;
+    });
+
+    return channel.historyRefreshPromise;
+  }
+
+  private async doRefreshChannelHistory(channel: MarketChannelState): Promise<boolean> {
+    const settings = INTERVAL_SETTINGS[channel.interval];
+    const previousLength = channel.candles.length;
+    const previousFirstTimestamp = channel.candles[0]?.timestamp ?? null;
+    const previousLastTimestamp = channel.candles[channel.candles.length - 1]?.timestamp ?? null;
+
+    const candles = await this.fetchHistoricalCandles(
+      channel.symbol,
+      channel.interval,
+      settings.historyLimit
+    );
+
+    if (candles.length === 0) {
+      return false;
+    }
+
+    channel.candles = candles;
+    channel.currentPrice = candles[candles.length - 1]?.close ?? null;
+    this.recomputeDerivedState(channel, settings);
+
+    const nextFirstTimestamp = candles[0]?.timestamp ?? null;
+    const nextLastTimestamp = candles[candles.length - 1]?.timestamp ?? null;
+
+    return (
+      previousLength !== candles.length ||
+      previousFirstTimestamp !== nextFirstTimestamp ||
+      previousLastTimestamp !== nextLastTimestamp
+    );
+  }
+
+  private emitSnapshotUpdate(channel: MarketChannelState): void {
+    this.emit('snapshot_update', {
+      symbol: channel.symbol,
+      interval: channel.interval,
+      payload: this.buildSnapshot(channel),
+    } as SnapshotUpdateEvent);
   }
 
   private recomputeDerivedState(channel: MarketChannelState, settings: IntervalSettings): void {
@@ -313,6 +394,16 @@ export class MarketDataService extends EventEmitter {
 
     socket.on('open', () => {
       marketLogger.info({ channel: channel.key }, 'Market kline stream connected');
+
+      void this.refreshChannelHistory(channel)
+        .then((changed) => {
+          if (changed) {
+            this.emitSnapshotUpdate(channel);
+          }
+        })
+        .catch((error) => {
+          marketLogger.warn({ error, channel: channel.key }, 'Failed to refresh channel on connect');
+        });
     });
 
     socket.on('message', (raw) => {
@@ -358,9 +449,30 @@ export class MarketDataService extends EventEmitter {
         }
 
         const settings = INTERVAL_SETTINGS[state.interval];
+        const previousLastTimestamp = state.candles[state.candles.length - 1]?.timestamp ?? null;
         state.candles = upsertCandle(state.candles, candle, settings.historyLimit);
         state.currentPrice = candle.close;
         this.recomputeDerivedState(state, settings);
+
+        if (previousLastTimestamp !== null) {
+          const intervalMs = getIntervalMs(state.interval);
+          const delta = candle.timestamp - previousLastTimestamp;
+
+          if (delta > intervalMs) {
+            void this.refreshChannelHistory(state)
+              .then((changed) => {
+                if (changed) {
+                  this.emitSnapshotUpdate(state);
+                }
+              })
+              .catch((error) => {
+                marketLogger.warn(
+                  { error, channel: state.key, previousLastTimestamp, currentTimestamp: candle.timestamp },
+                  'Failed to backfill missing channel candles'
+                );
+              });
+          }
+        }
 
         this.emit('kline_update', {
           symbol: state.symbol,

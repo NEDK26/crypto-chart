@@ -8,7 +8,12 @@ import {
   isSupportedInterval,
   splitChannelKey,
 } from './intervalConfig.js';
-import { MarketDataService, type DepthUpdateEvent, type KlineUpdateEvent } from './marketDataService.js';
+import {
+  MarketDataService,
+  type DepthUpdateEvent,
+  type KlineUpdateEvent,
+  type SnapshotUpdateEvent,
+} from './marketDataService.js';
 import type { KlineInterval, MarketClientCommand, MarketServerEvent } from './types.js';
 
 loadEnv();
@@ -204,6 +209,23 @@ function broadcastDepthUpdate(event: DepthUpdateEvent): void {
   }
 }
 
+function broadcastSnapshotUpdate(event: SnapshotUpdateEvent): void {
+  const channelKey = getChannelKey(event.symbol, event.interval);
+
+  for (const [client, context] of clients.entries()) {
+    if (!context.subscriptions.has(channelKey)) {
+      continue;
+    }
+
+    sendWsEvent(client, {
+      type: 'snapshot',
+      symbol: event.symbol,
+      interval: event.interval,
+      payload: event.payload,
+    });
+  }
+}
+
 async function handleHttpRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   if (!request.url) {
     writeJson(response, 400, { error: 'Missing request url' });
@@ -296,6 +318,7 @@ server.on('upgrade', (request, socket, head) => {
 
 marketDataService.onKlineUpdate(broadcastKlineUpdate);
 marketDataService.onDepthUpdate(broadcastDepthUpdate);
+marketDataService.onSnapshotUpdate(broadcastSnapshotUpdate);
 
 server.listen(config.port, config.host, () => {
   marketLogger.info(
