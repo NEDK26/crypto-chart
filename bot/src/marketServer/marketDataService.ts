@@ -339,7 +339,11 @@ export class MarketDataService extends EventEmitter {
     } as SnapshotUpdateEvent);
   }
 
-  private recomputeDerivedState(channel: MarketChannelState, settings: IntervalSettings): void {
+  private recomputeDerivedState(
+    channel: MarketChannelState,
+    settings: IntervalSettings,
+    eventTimestamp?: number
+  ): void {
     const bollingerSeries = calculateBollingerBands(channel.candles, {
       period: 20,
       stdDevMultiplier: 2,
@@ -351,6 +355,7 @@ export class MarketDataService extends EventEmitter {
       pivotWindow: settings.pivotWindow,
       clusterTolerance: settings.clusterTolerance,
       maxLevelsPerType: settings.maxLevelsPerType,
+      proximityThresholdRatio: settings.proximityThresholdRatio,
     });
 
     const signalResult = evaluateSignals({
@@ -361,6 +366,7 @@ export class MarketDataService extends EventEmitter {
       previousFingerprint: channel.lastSignalFingerprint,
       proximityThresholdRatio: settings.proximityThresholdRatio,
       signalLimit: SIGNAL_LIMIT,
+      eventTimestamp,
     });
 
     channel.signals = signalResult.signals;
@@ -409,6 +415,7 @@ export class MarketDataService extends EventEmitter {
     socket.on('message', (raw) => {
       try {
         const payload = JSON.parse(raw.toString()) as {
+          E?: number;
           k?: {
             t: number;
             o: string;
@@ -452,7 +459,11 @@ export class MarketDataService extends EventEmitter {
         const previousLastTimestamp = state.candles[state.candles.length - 1]?.timestamp ?? null;
         state.candles = upsertCandle(state.candles, candle, settings.historyLimit);
         state.currentPrice = candle.close;
-        this.recomputeDerivedState(state, settings);
+        this.recomputeDerivedState(
+          state,
+          settings,
+          typeof payload.E === 'number' && Number.isFinite(payload.E) ? payload.E : Date.now()
+        );
 
         if (previousLastTimestamp !== null) {
           const intervalMs = getIntervalMs(state.interval);

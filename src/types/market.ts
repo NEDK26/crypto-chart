@@ -16,10 +16,19 @@ export interface BollingerBandPoint {
 
 export type LevelType = 'support' | 'resistance';
 
+export type LevelTier = 'strong' | 'mid' | 'weak';
+
 export interface PriceLevel {
   id: string;
   type: LevelType;
   price: number;
+  sourceTimestamp?: number;
+  zoneLow?: number;
+  zoneHigh?: number;
+  rank?: number;
+  tier?: LevelTier;
+  distancePct?: number;
+  isNear?: boolean;
   touches: number;
   strength: number;
   lastTouchedAt: number;

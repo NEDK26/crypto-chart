@@ -2,7 +2,7 @@
 > crypto-trading-bot@1.0.0 dev:market
 > tsx watch src/marketServer/index.ts
 
-[17:47:23] [32mINFO[39m: [36mMarket server started[39m
+[13:18:26] [32mINFO[39m: [36mMarket server started[39m
     host: "0.0.0.0"
     port: 4180
     timeoutMs: 8000
@@ -13,11 +13,11 @@
       "https://api2.binance.com",
       "https://api3.binance.com"
     ]
-[17:50:33] [32mINFO[39m: [36mMarket kline stream connected[39m
-    channel: "BTCUSDC:1m"
-[17:50:33] [32mINFO[39m: [36mMarket depth stream connected[39m
-    symbol: "BTCUSDC"
-[17:50:37] [32mINFO[39m: [36mMarket kline stream connected[39m
-    channel: "ETHUSDC:1m"
-[17:50:37] [32mINFO[39m: [36mMarket depth stream connected[39m
+[13:18:29] [32mINFO[39m: [36mMarket depth stream connected[39m
     symbol: "ETHUSDC"
+[13:18:29] [32mINFO[39m: [36mMarket kline stream connected[39m
+    channel: "ETHUSDC:1m"
+[13:18:30] [32mINFO[39m: [36mMarket depth stream connected[39m
+    symbol: "BTCUSDC"
+[13:18:30] [32mINFO[39m: [36mMarket kline stream connected[39m
+    channel: "BTCUSDC:1m"

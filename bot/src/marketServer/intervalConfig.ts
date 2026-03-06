@@ -18,38 +18,38 @@ const INTERVAL_TO_MS: Record<KlineInterval, number> = {
 
 export const INTERVAL_SETTINGS: Record<KlineInterval, IntervalSettings> = {
   '1m': {
-    historyLimit: 1000,
+    historyLimit: 2000,
     pivotWindow: 5,
     clusterTolerance: 0.0016,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0009,
   },
   '5m': {
-    historyLimit: 1000,
+    historyLimit: 2000,
     pivotWindow: 3,
     clusterTolerance: 0.0028,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0011,
   },
   '1h': {
-    historyLimit: 800,
+    historyLimit: 1600,
     pivotWindow: 3,
     clusterTolerance: 0.003,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0016,
   },
   '4h': {
-    historyLimit: 700,
+    historyLimit: 500,
     pivotWindow: 3,
     clusterTolerance: 0.0042,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0022,
   },
   '1d': {
     historyLimit: 500,
     pivotWindow: 2,
     clusterTolerance: 0.006,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0032,
   },
 };

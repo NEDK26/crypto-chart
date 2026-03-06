@@ -12,15 +12,26 @@ import {
 import {
   SortableContext,
   arrayMove,
+  rectSortingStrategy,
   sortableKeyboardCoordinates,
   useSortable,
-  verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { ActionType, LineType, dispose, init, type Chart, type Crosshair, type Point } from 'klinecharts';
+import {
+  ActionType,
+  LineType,
+  PolygonType,
+  dispose,
+  init,
+  registerOverlay,
+  type Chart,
+  type Crosshair,
+  type Point,
+} from 'klinecharts';
 import type {
   BollingerBandPoint,
   Candle,
+  LevelType,
   OrderBookSnapshot,
   PriceLevel,
   SignalEvent,
@@ -33,14 +44,123 @@ const MIN_VOLUME_PANE_HEIGHT = 72;
 const BOLLINGER_INDICATOR_NAME = 'BOLL';
 const CANDLE_PANE_ID = 'candle_pane';
 const SUPPORT_RESISTANCE_GROUP = 'sr-levels';
-const SUPPORT_LINE_COLOR = 'rgba(103, 236, 182, 0.95)';
-const RESISTANCE_LINE_COLOR = 'rgba(255, 149, 170, 0.95)';
+const SUPPORT_ZONE_OVERLAY_NAME = 'supportResistanceZoneBand';
 const MARKET_SNAPSHOT_ENDPOINT = '/api/market/snapshot';
 const MARKET_WS_ENDPOINT = '/ws/market';
+const SUPPORT_COLOR_RGB = '103, 236, 182';
+const RESISTANCE_COLOR_RGB = '255, 149, 170';
+
+const LEVEL_LINE_SIZE_BY_TIER = {
+  strong: 2,
+  mid: 1.5,
+  weak: 1,
+} as const;
+
+const LEVEL_ZONE_OPACITY_BY_TIER = {
+  strong: 0.16,
+  mid: 0.11,
+  weak: 0.07,
+} as const;
+
+const HIGHER_INTERVAL_MAP: Partial<Record<KlineInterval, KlineInterval>> = {
+  '1m': '5m',
+  '5m': '1h',
+  '1h': '4h',
+  '4h': '1d',
+};
+
+let supportZoneOverlayRegistered = false;
+
+function toRgba(rgb: string, alpha: number): string {
+  const normalizedAlpha = Math.max(0, Math.min(1, alpha));
+  return `rgba(${rgb}, ${normalizedAlpha})`;
+}
+
+function getLevelColorRgb(type: LevelType): string {
+  return type === 'support' ? SUPPORT_COLOR_RGB : RESISTANCE_COLOR_RGB;
+}
+
+function ensureSupportZoneOverlayRegistered(): void {
+  if (supportZoneOverlayRegistered) {
+    return;
+  }
+
+  registerOverlay({
+    name: SUPPORT_ZONE_OVERLAY_NAME,
+    totalStep: 3,
+    needDefaultPointFigure: false,
+    needDefaultXAxisFigure: false,
+    needDefaultYAxisFigure: false,
+    createPointFigures: ({ coordinates, bounding, overlay }) => {
+      if (coordinates.length < 2) {
+        return [];
+      }
+
+      const first = coordinates[0];
+      const second = coordinates[1];
+      const startX = Math.min(first.x, second.x);
+      const topY = Math.min(first.y, second.y);
+      const bottomY = Math.max(first.y, second.y);
+      const zoneHeight = Math.max(bottomY - topY, 1);
+      const centerY = topY + zoneHeight / 2;
+      const zoneWidth = Math.max(bounding.width - startX, 1);
+      const extendData =
+        typeof overlay.extendData === 'object' && overlay.extendData !== null
+          ? (overlay.extendData as { label?: string; showLabel?: boolean })
+          : null;
+      const text =
+        extendData && typeof extendData.label === 'string' ? String(extendData.label) : '';
+      const showLabel = Boolean(extendData?.showLabel) && text.length > 0;
+
+      const figures: Array<{
+        type: 'rect' | 'line' | 'text';
+        attrs: Record<string, unknown>;
+        ignoreEvent?: boolean;
+      }> = [
+        {
+          type: 'rect',
+          attrs: {
+            x: startX,
+            y: topY,
+            width: zoneWidth,
+            height: zoneHeight,
+          },
+        },
+        {
+          type: 'line',
+          attrs: {
+            coordinates: [
+              { x: startX, y: centerY },
+              { x: bounding.width, y: centerY },
+            ],
+          },
+        },
+      ];
+
+      if (showLabel) {
+        figures.push({
+          type: 'text',
+          attrs: {
+            x: Math.max(6, bounding.width - 8),
+            y: centerY,
+            text,
+            align: 'right',
+            baseline: 'middle',
+          },
+          ignoreEvent: true,
+        });
+      }
+
+      return figures;
+    },
+  });
+
+  supportZoneOverlayRegistered = true;
+}
 
 type KlineInterval = '1m' | '5m' | '1h' | '4h' | '1d';
 type MarketSymbol = 'BTCUSDC' | 'ETHUSDC';
-type InsightWidgetId = 'bollinger' | 'levels' | 'orderbook' | 'signals';
+type InsightWidgetId = 'levels' | 'orderbook' | 'signals';
 
 interface InsightWidgetConfig {
   id: InsightWidgetId;
@@ -59,7 +179,6 @@ interface SortableInsightCardProps {
 const INSIGHT_WIDGET_ORDER_STORAGE_KEY = 'quant-insight-widget-order-v1';
 const INSIGHT_LAYOUT_LOCK_STORAGE_KEY = 'quant-insight-layout-lock-v1';
 const INSIGHT_WIDGET_CONFIGS: InsightWidgetConfig[] = [
-  { id: 'bollinger', title: '布林带快照' },
   { id: 'levels', title: '关键价位' },
   { id: 'orderbook', title: '盘口深度', cardClassName: 'orderbook-card' },
   { id: 'signals', title: '信号流', cardClassName: 'signals-card' },
@@ -179,35 +298,35 @@ const INTERVAL_SETTINGS: Record<KlineInterval, IntervalSettings> = {
     historyLimit: 1000,
     pivotWindow: 5,
     clusterTolerance: 0.0016,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0009,
   },
   '5m': {
     historyLimit: 1000,
     pivotWindow: 3,
     clusterTolerance: 0.0028,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0011,
   },
   '1h': {
     historyLimit: 800,
     pivotWindow: 3,
     clusterTolerance: 0.003,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0016,
   },
   '4h': {
     historyLimit: 700,
     pivotWindow: 3,
     clusterTolerance: 0.0042,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0022,
   },
   '1d': {
     historyLimit: 500,
     pivotWindow: 2,
     clusterTolerance: 0.006,
-    maxLevelsPerType: 4,
+    maxLevelsPerType: 3,
     proximityThresholdRatio: 0.0032,
   },
 };
@@ -332,6 +451,46 @@ function formatSignedDelta(value: number): string {
   return `${prefix}${value.toFixed(2)}%`;
 }
 
+function resolveLevelDistancePct(level: PriceLevel, referencePrice: number | null): number {
+  if (referencePrice !== null && Number.isFinite(referencePrice) && referencePrice > 0) {
+    return ((level.price - referencePrice) / referencePrice) * 100;
+  }
+
+  return typeof level.distancePct === 'number' ? level.distancePct : 0;
+}
+
+function buildLevelTagText(
+  level: PriceLevel,
+  referencePrice: number | null,
+  sourceIntervalLabel: string | null
+): string {
+  const sidePrefix = level.type === 'support' ? 'S' : 'R';
+  const distancePct = resolveLevelDistancePct(level, referencePrice);
+  const rankText = `${sidePrefix}${level.rank ?? ''}`;
+  const intervalSuffix = sourceIntervalLabel ? `(${sourceIntervalLabel})` : '';
+
+  return `${rankText}${intervalSuffix} ${level.price.toFixed(2)} ${formatSignedDelta(
+    distancePct
+  )} x${level.touches}`;
+}
+
+function dedupeLevelsByPriceGap(levels: PriceLevel[], minGapRatio: number): PriceLevel[] {
+  const picked: PriceLevel[] = [];
+
+  for (const level of levels) {
+    const isFarEnough = picked.every((existing) => {
+      const denominator = Math.max(existing.price, level.price, 1);
+      return Math.abs(existing.price - level.price) / denominator >= minGapRatio;
+    });
+
+    if (isFarEnough) {
+      picked.push(level);
+    }
+  }
+
+  return picked;
+}
+
 function formatVolume(value: number | null): string {
   if (value === null || Number.isNaN(value)) {
     return '--';
@@ -399,14 +558,16 @@ export default function QuantChartDashboard() {
   const [chartReady, setChartReady] = useState(false);
   const [candles, setCandles] = useState<Candle[]>([]);
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
-  const [latestBand, setLatestBand] = useState<BollingerBandPoint | null>(null);
   const [supportResistanceLevels, setSupportResistanceLevels] = useState<PriceLevel[]>([]);
+  const [higherIntervalLevels, setHigherIntervalLevels] = useState<PriceLevel[]>([]);
   const [orderBook, setOrderBook] = useState<OrderBookSnapshot>({ bids: [], asks: [] });
   const [signals, setSignals] = useState<SignalEvent[]>([]);
   const [hoverCandle, setHoverCandle] = useState<HoverCandleInfo | null>(null);
+  const [hoveredLevelKey, setHoveredLevelKey] = useState<string | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<MarketSymbol>('BTCUSDC');
   const [selectedInterval, setSelectedInterval] = useState<KlineInterval>('1m');
   const [showSupportResistanceLines, setShowSupportResistanceLines] = useState(true);
+  const [showHigherIntervalOverlay, setShowHigherIntervalOverlay] = useState(true);
   const [insightWidgetOrder, setInsightWidgetOrder] = useState<InsightWidgetId[]>(() =>
     loadInsightWidgetOrder()
   );
@@ -426,6 +587,10 @@ export default function QuantChartDashboard() {
     INTERVAL_OPTIONS.find((option) => option.value === selectedInterval)?.label ?? selectedInterval;
   const selectedSymbolLabel =
     SYMBOL_OPTIONS.find((option) => option.value === selectedSymbol)?.label ?? selectedSymbol;
+  const higherInterval = HIGHER_INTERVAL_MAP[selectedInterval] ?? null;
+  const higherIntervalLabel = higherInterval
+    ? (INTERVAL_OPTIONS.find((option) => option.value === higherInterval)?.label ?? higherInterval)
+    : null;
 
   const insightWidgetConfigMap = useMemo(() => {
     return INSIGHT_WIDGET_CONFIGS.reduce<Record<InsightWidgetId, InsightWidgetConfig>>(
@@ -434,10 +599,9 @@ export default function QuantChartDashboard() {
         return accumulator;
       },
       {
-        bollinger: INSIGHT_WIDGET_CONFIGS[0],
-        levels: INSIGHT_WIDGET_CONFIGS[1],
-        orderbook: INSIGHT_WIDGET_CONFIGS[2],
-        signals: INSIGHT_WIDGET_CONFIGS[3],
+        levels: INSIGHT_WIDGET_CONFIGS[0],
+        orderbook: INSIGHT_WIDGET_CONFIGS[1],
+        signals: INSIGHT_WIDGET_CONFIGS[2],
       }
     );
   }, []);
@@ -498,14 +662,17 @@ export default function QuantChartDashboard() {
       return;
     }
 
+    ensureSupportZoneOverlayRegistered();
+
     const container = chartContainerRef.current;
 
     setCandles([]);
     setSignals([]);
     setCurrentPrice(null);
-    setLatestBand(null);
     setSupportResistanceLevels([]);
+    setHigherIntervalLevels([]);
     setOrderBook({ bids: [], asks: [] });
+    setHoveredLevelKey(null);
     candlesRef.current = [];
     setHoverCandle(null);
     lastHoverKeyRef.current = null;
@@ -664,6 +831,7 @@ export default function QuantChartDashboard() {
     const handleMouseLeave = () => {
       lastHoverKeyRef.current = null;
       setHoverCandle(null);
+      setHoveredLevelKey(null);
     };
 
     chart.subscribeAction(ActionType.OnCrosshairChange, handleCrosshairChange);
@@ -723,7 +891,6 @@ export default function QuantChartDashboard() {
       candlesRef.current = snapshot.candles;
       setCandles(snapshot.candles);
       setCurrentPrice(snapshot.currentPrice);
-      setLatestBand(snapshot.latestBand);
       setSupportResistanceLevels(snapshot.supportResistanceLevels);
       setOrderBook(snapshot.orderBook);
       setSignals(snapshot.signals);
@@ -747,64 +914,129 @@ export default function QuantChartDashboard() {
     };
 
     const connectMarketStream = () => {
-      const socket = new WebSocket(buildMarketWsUrl());
-      marketWsRef.current = socket;
+      let reconnectTimer: number | null = null;
+      let reconnectAttempt = 0;
+      let closedByEffectCleanup = false;
 
-      socket.onopen = () => {
-        socket.send(JSON.stringify(subscribeCommand));
+      const scheduleReconnect = () => {
+        if (!mounted || closedByEffectCleanup || reconnectTimer !== null) {
+          return;
+        }
+
+        const delay = Math.min(1000 * 2 ** Math.min(reconnectAttempt, 4), 8000);
+        reconnectAttempt += 1;
+
+        reconnectTimer = window.setTimeout(() => {
+          reconnectTimer = null;
+          openSocket();
+        }, delay);
       };
 
-      socket.onmessage = (event) => {
-        let message: MarketServerEvent;
-
-        try {
-          message = JSON.parse(event.data) as MarketServerEvent;
-        } catch {
+      const openSocket = () => {
+        if (!mounted || closedByEffectCleanup) {
           return;
         }
 
-        if (message.type === 'error') {
-          console.warn('Market service error:', message.payload.message);
-          return;
-        }
+        const socket = new WebSocket(buildMarketWsUrl());
+        marketWsRef.current = socket;
 
-        if (message.type === 'depth_update') {
-          if (message.symbol !== selectedSymbol) {
+        socket.onopen = () => {
+          if (marketWsRef.current !== socket) {
             return;
           }
 
-          setOrderBook(message.payload.orderBook);
-          return;
-        }
+          reconnectAttempt = 0;
+          socket.send(JSON.stringify(subscribeCommand));
+        };
 
-        if (message.symbol !== selectedSymbol || message.interval !== selectedInterval) {
-          return;
-        }
+        socket.onmessage = (event) => {
+          if (marketWsRef.current !== socket) {
+            return;
+          }
 
-        if (message.type === 'snapshot') {
-          applySnapshot(message.payload);
-          return;
-        }
+          let message: MarketServerEvent;
 
-        chartRef.current?.updateData(message.payload.candle);
-        setCandles((previous) => {
-          const next = upsertCandle(previous, message.payload.candle, historyLimit);
-          candlesRef.current = next;
-          return next;
-        });
-        setCurrentPrice(message.payload.currentPrice);
-        setLatestBand(message.payload.latestBand);
-        setSupportResistanceLevels(message.payload.supportResistanceLevels);
-        setSignals(message.payload.signals);
+          try {
+            message = JSON.parse(event.data) as MarketServerEvent;
+          } catch {
+            return;
+          }
+
+          if (message.type === 'error') {
+            console.warn('Market service error:', message.payload.message);
+            return;
+          }
+
+          if (message.type === 'depth_update') {
+            if (message.symbol !== selectedSymbol) {
+              return;
+            }
+
+            setOrderBook(message.payload.orderBook);
+            return;
+          }
+
+          if (message.symbol !== selectedSymbol || message.interval !== selectedInterval) {
+            return;
+          }
+
+          if (message.type === 'snapshot') {
+            applySnapshot(message.payload);
+            return;
+          }
+
+          chartRef.current?.updateData(message.payload.candle);
+          setCandles((previous) => {
+            const next = upsertCandle(previous, message.payload.candle, historyLimit);
+            candlesRef.current = next;
+            return next;
+          });
+          setCurrentPrice(message.payload.currentPrice);
+          setSupportResistanceLevels(message.payload.supportResistanceLevels);
+          setSignals(message.payload.signals);
+        };
+
+        socket.onerror = () => {
+          if (marketWsRef.current !== socket) {
+            return;
+          }
+
+          socket.close();
+        };
+
+        socket.onclose = () => {
+          if (marketWsRef.current === socket) {
+            marketWsRef.current = null;
+          }
+
+          if (closedByEffectCleanup || !mounted) {
+            return;
+          }
+
+          scheduleReconnect();
+        };
       };
 
+      openSocket();
+
       return () => {
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify(unsubscribeCommand));
+        closedByEffectCleanup = true;
+
+        if (reconnectTimer !== null) {
+          window.clearTimeout(reconnectTimer);
+          reconnectTimer = null;
         }
 
-        socket.close();
-        if (marketWsRef.current === socket) {
+        const activeSocket = marketWsRef.current;
+        if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
+          activeSocket.send(JSON.stringify(unsubscribeCommand));
+        }
+
+        if (activeSocket && activeSocket.readyState !== WebSocket.CLOSED) {
+          activeSocket.close();
+        }
+
+        if (marketWsRef.current === activeSocket) {
           marketWsRef.current = null;
         }
       };
@@ -861,6 +1093,53 @@ export default function QuantChartDashboard() {
   }, [historyLimit, selectedInterval, selectedSymbol]);
 
   useEffect(() => {
+    if (!higherInterval) {
+      setHigherIntervalLevels([]);
+      return;
+    }
+
+    let cancelled = false;
+    let latestRequestId = 0;
+
+    const loadHigherIntervalLevels = async () => {
+      const requestId = ++latestRequestId;
+
+      try {
+        const response = await fetch(
+          `${MARKET_SNAPSHOT_ENDPOINT}?symbol=${selectedSymbol}&interval=${higherInterval}`
+        );
+
+        if (!response.ok) {
+          throw new Error(`Market server returned ${response.status}`);
+        }
+
+        const snapshot = (await response.json()) as MarketSnapshot;
+        if (!cancelled && requestId === latestRequestId) {
+          setHigherIntervalLevels(snapshot.supportResistanceLevels);
+        }
+      } catch (error) {
+        if (!cancelled && requestId === latestRequestId) {
+          setHigherIntervalLevels([]);
+        }
+
+        if (!cancelled) {
+          console.warn('Failed to load higher interval levels', error);
+        }
+      }
+    };
+
+    void loadHigherIntervalLevels();
+    const timer = window.setInterval(() => {
+      void loadHigherIntervalLevels();
+    }, 45_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [higherInterval, selectedSymbol]);
+
+  useEffect(() => {
     if (!chartReady || !chartRef.current) {
       return;
     }
@@ -877,30 +1156,119 @@ export default function QuantChartDashboard() {
       return;
     }
 
-    const visibleLevels = supportResistanceLevels;
+    const primaryLevels = dedupeLevelsByPriceGap(supportResistanceLevels, 0.0008);
+    const overlayLevels =
+      higherInterval && showHigherIntervalOverlay
+        ? dedupeLevelsByPriceGap(higherIntervalLevels, 0.0012)
+        : [];
 
-    if (visibleLevels.length === 0) {
+    if (primaryLevels.length === 0 && overlayLevels.length === 0) {
       return;
     }
 
-    chart.createOverlay(
-      visibleLevels.map((level) => ({
-        name: 'horizontalStraightLine',
+    const buildZoneOverlay = (level: PriceLevel, isHigherInterval: boolean) => {
+      const hoverKey = `${isHigherInterval ? 'higher' : 'primary'}:${level.id}`;
+      const rgb = getLevelColorRgb(level.type);
+      const dynamicDistancePct = resolveLevelDistancePct(level, livePrice);
+      const tier = level.tier ?? 'mid';
+      const isNear = Boolean(level.isNear) || Math.abs(dynamicDistancePct) <= 0.25;
+      const zoneLow =
+        typeof level.zoneLow === 'number' && Number.isFinite(level.zoneLow)
+          ? level.zoneLow
+          : level.price;
+      const zoneHigh =
+        typeof level.zoneHigh === 'number' && Number.isFinite(level.zoneHigh)
+          ? level.zoneHigh
+          : level.price;
+
+      const baseLineSize = LEVEL_LINE_SIZE_BY_TIER[tier];
+      const lineSize = baseLineSize + (isNear ? 0.45 : 0);
+      const zoneOpacity =
+        LEVEL_ZONE_OPACITY_BY_TIER[tier] * (isHigherInterval ? 0.62 : 1) *
+        (isNear ? 1.08 : 1);
+      const lineOpacity = (isHigherInterval ? 0.58 : 0.92) + (isNear ? 0.06 : 0);
+
+      return {
+        name: SUPPORT_ZONE_OVERLAY_NAME,
         groupId: SUPPORT_RESISTANCE_GROUP,
         lock: true,
-        points: [{ timestamp: lastCandle.timestamp, value: level.price }],
+        zLevel: isHigherInterval ? 1 : 3,
+        points: [
+          { timestamp: level.sourceTimestamp ?? lastCandle.timestamp, value: zoneLow },
+          { timestamp: lastCandle.timestamp, value: zoneHigh },
+        ],
+        extendData: {
+          label: buildLevelTagText(
+            level,
+            livePrice,
+            isHigherInterval && higherIntervalLabel ? higherIntervalLabel : null
+          ),
+          showLabel: hoveredLevelKey === hoverKey,
+        },
+        onMouseEnter: () => {
+          setHoveredLevelKey(hoverKey);
+          return true;
+        },
+        onMouseLeave: () => {
+          setHoveredLevelKey((current) => (current === hoverKey ? null : current));
+          return true;
+        },
         styles: {
+          rect: {
+            style: PolygonType.Fill,
+            color: toRgba(rgb, Math.min(zoneOpacity, 0.2)),
+            borderColor: 'transparent',
+            borderSize: 0,
+            borderStyle: LineType.Solid,
+            borderDashedValue: [],
+            borderRadius: 0,
+          },
           line: {
-            color: level.type === 'support' ? SUPPORT_LINE_COLOR : RESISTANCE_LINE_COLOR,
-            size: 1,
-            style: LineType.Solid,
-            dashedValue: [],
+            color: toRgba(rgb, Math.min(lineOpacity, 0.96)),
+            size: lineSize,
+            style: isHigherInterval ? LineType.Dashed : LineType.Solid,
+            dashedValue: isHigherInterval ? [6, 4] : [],
             smooth: false,
           },
+          text: {
+            style: PolygonType.Fill,
+            color: toRgba(rgb, isHigherInterval ? 0.9 : 0.96),
+            size: isNear ? 11 : 10,
+            family: 'JetBrains Mono, SFMono-Regular, Consolas, monospace',
+            weight: isNear ? '700' : '600',
+            borderStyle: LineType.Solid,
+            borderDashedValue: [],
+            borderSize: 1,
+            borderColor: toRgba(rgb, isHigherInterval ? 0.32 : 0.46),
+            borderRadius: 4,
+            backgroundColor: 'rgba(7, 17, 27, 0.78)',
+            paddingLeft: 5,
+            paddingRight: 5,
+            paddingTop: 2,
+            paddingBottom: 2,
+          },
         },
-      }))
-    );
-  }, [candles, chartReady, showSupportResistanceLines, supportResistanceLevels]);
+      };
+    };
+
+    const overlays = [
+      ...overlayLevels.map((level) => buildZoneOverlay(level, true)),
+      ...primaryLevels.map((level) => buildZoneOverlay(level, false)),
+    ];
+
+    chart.createOverlay(overlays);
+  }, [
+    candles,
+    chartReady,
+    higherInterval,
+    higherIntervalLabel,
+    higherIntervalLevels,
+    hoveredLevelKey,
+    livePrice,
+    showHigherIntervalOverlay,
+    showSupportResistanceLines,
+    supportResistanceLevels,
+  ]);
 
   const handleInsightWidgetDragEnd = (event: DragEndEvent) => {
     if (insightLayoutLocked) {
@@ -936,33 +1304,6 @@ export default function QuantChartDashboard() {
       return null;
     }
 
-    if (widgetId === 'bollinger') {
-      return (
-        <SortableInsightCard
-          key={widgetConfig.id}
-          id={widgetConfig.id}
-          title={widgetConfig.title}
-          cardClassName={widgetConfig.cardClassName}
-          locked={insightLayoutLocked}
-        >
-          <div className="metric-grid">
-            <div>
-              <span>上轨</span>
-              <strong>{formatPrice(latestBand?.upper ?? null)}</strong>
-            </div>
-            <div>
-              <span>中轨</span>
-              <strong>{formatPrice(latestBand?.middle ?? null)}</strong>
-            </div>
-            <div>
-              <span>下轨</span>
-              <strong>{formatPrice(latestBand?.lower ?? null)}</strong>
-            </div>
-          </div>
-        </SortableInsightCard>
-      );
-    }
-
     if (widgetId === 'levels') {
       return (
         <SortableInsightCard
@@ -976,13 +1317,26 @@ export default function QuantChartDashboard() {
             {supportResistanceLevels.length === 0 ? (
               <p className="empty-hint">历史数据不足，等待形成结构点。</p>
             ) : (
-              supportResistanceLevels.map((level: PriceLevel) => (
-                <div key={level.id} className={`level-item ${level.type}`}>
-                  <span>{level.type === 'support' ? '支撑' : '阻力'}</span>
-                  <strong>{formatPrice(level.price)}</strong>
-                  <small>{`触发 ${level.touches} 次`}</small>
-                </div>
-              ))
+              supportResistanceLevels.map((level: PriceLevel, index) => {
+                const sidePrefix = level.type === 'support' ? 'S' : 'R';
+                const tier = level.tier ?? 'mid';
+                const rank = level.rank ?? index + 1;
+                const tierLabel =
+                  tier === 'strong' ? '强' : tier === 'mid' ? '中' : '弱';
+                const distancePct = resolveLevelDistancePct(level, livePrice);
+                const isNear = Boolean(level.isNear) || Math.abs(distancePct) <= 0.25;
+
+                return (
+                  <div
+                    key={level.id}
+                    className={`level-item ${level.type} ${tier} ${isNear ? 'near' : ''}`}
+                  >
+                    <span>{`${sidePrefix}${rank} · ${tierLabel}`}</span>
+                    <strong>{formatPrice(level.price)}</strong>
+                    <small>{`${formatSignedDelta(distancePct)} · x${level.touches}`}</small>
+                  </div>
+                );
+              })
             )}
           </div>
         </SortableInsightCard>
@@ -1093,10 +1447,25 @@ export default function QuantChartDashboard() {
             type="button"
             className="sr-toggle"
             data-visible={showSupportResistanceLines ? 'true' : 'false'}
-            onClick={() => setShowSupportResistanceLines((previous) => !previous)}
+            onClick={() => {
+              setHoveredLevelKey(null);
+              setShowSupportResistanceLines((previous) => !previous);
+            }}
           >
             {showSupportResistanceLines ? '隐藏结构线' : '显示结构线'}
           </button>
+          {higherIntervalLabel ? (
+            <button
+              type="button"
+              className="higher-interval-toggle"
+              data-visible={showHigherIntervalOverlay ? 'true' : 'false'}
+              onClick={() => setShowHigherIntervalOverlay((previous) => !previous)}
+            >
+              {showHigherIntervalOverlay
+                ? `隐藏${higherIntervalLabel}叠加`
+                : `显示${higherIntervalLabel}叠加`}
+            </button>
+          ) : null}
           <button
             type="button"
             className="layout-lock-toggle"
@@ -1153,18 +1522,18 @@ export default function QuantChartDashboard() {
             )}
           </div>
         </article>
+      </section>
 
-        <aside className="insight-panel">
-          <DndContext
-            sensors={dndSensors}
-            collisionDetection={closestCenter}
-            onDragEnd={handleInsightWidgetDragEnd}
-          >
-            <SortableContext items={insightWidgetOrder} strategy={verticalListSortingStrategy}>
-              {insightWidgetOrder.map((widgetId) => renderInsightWidget(widgetId))}
-            </SortableContext>
-          </DndContext>
-        </aside>
+      <section className="insight-grid">
+        <DndContext
+          sensors={dndSensors}
+          collisionDetection={closestCenter}
+          onDragEnd={handleInsightWidgetDragEnd}
+        >
+          <SortableContext items={insightWidgetOrder} strategy={rectSortingStrategy}>
+            {insightWidgetOrder.map((widgetId) => renderInsightWidget(widgetId))}
+          </SortableContext>
+        </DndContext>
       </section>
     </div>
   );

@@ -21,6 +21,7 @@ export interface SignalEvaluationInput {
   previousFingerprint: string | null;
   proximityThresholdRatio: number;
   signalLimit: number;
+  eventTimestamp?: number;
 }
 
 export interface SignalEvaluationResult {
@@ -37,6 +38,8 @@ function buildSignalEvent(type: SignalType, price: number, timestamp: number): S
     description: SIGNAL_DESCRIPTIONS[type],
   };
 }
+
+const SIGNAL_DEDUP_WINDOW_MS = 10_000;
 
 export function evaluateSignals(input: SignalEvaluationInput): SignalEvaluationResult {
   const lastCandle = input.candles[input.candles.length - 1];
@@ -60,15 +63,19 @@ export function evaluateSignals(input: SignalEvaluationInput): SignalEvaluationR
     .sort((left, right) => left.price - right.price)[0];
 
   let nextSignal: SignalEvent | null = null;
+  const signalTimestamp =
+    typeof input.eventTimestamp === 'number' && Number.isFinite(input.eventTimestamp)
+      ? input.eventTimestamp
+      : lastCandle.timestamp;
 
   if (input.latestBand && lastCandle.close > input.latestBand.upper) {
-    nextSignal = buildSignalEvent('breakout_up', lastCandle.close, lastCandle.timestamp);
+    nextSignal = buildSignalEvent('breakout_up', lastCandle.close, signalTimestamp);
   } else if (input.latestBand && lastCandle.close < input.latestBand.lower) {
-    nextSignal = buildSignalEvent('breakout_down', lastCandle.close, lastCandle.timestamp);
+    nextSignal = buildSignalEvent('breakout_down', lastCandle.close, signalTimestamp);
   } else if (nearestSupport && Math.abs(lastCandle.close - nearestSupport.price) <= threshold) {
-    nextSignal = buildSignalEvent('support_touch', nearestSupport.price, lastCandle.timestamp);
+    nextSignal = buildSignalEvent('support_touch', nearestSupport.price, signalTimestamp);
   } else if (nearestResistance && Math.abs(lastCandle.close - nearestResistance.price) <= threshold) {
-    nextSignal = buildSignalEvent('resistance_touch', nearestResistance.price, lastCandle.timestamp);
+    nextSignal = buildSignalEvent('resistance_touch', nearestResistance.price, signalTimestamp);
   }
 
   if (!nextSignal) {
@@ -79,7 +86,7 @@ export function evaluateSignals(input: SignalEvaluationInput): SignalEvaluationR
   }
 
   const fingerprint = `${nextSignal.type}-${Math.round(nextSignal.price * 100)}-${Math.floor(
-    nextSignal.timestamp / 60000
+    nextSignal.timestamp / SIGNAL_DEDUP_WINDOW_MS
   )}`;
 
   if (input.previousFingerprint === fingerprint) {
