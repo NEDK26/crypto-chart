@@ -23,6 +23,8 @@ export type LevelTier = 'strong' | 'mid' | 'weak';
 export interface PriceLevel {
   id: string;
   type: LevelType;
+  sourceType?: LevelType;
+  isFlipped?: boolean;
   price: number;
   sourceTimestamp?: number;
   zoneLow?: number;

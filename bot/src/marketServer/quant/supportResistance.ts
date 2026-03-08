@@ -123,6 +123,8 @@ function mapRankedLevels(params: {
     return {
       id: `${params.side}-${index + 1}-${Math.round(price * 100)}`,
       type: params.side,
+      sourceType: item.cluster.type,
+      isFlipped: item.cluster.type !== params.side,
       price,
       sourceTimestamp: item.cluster.earliestTimestamp,
       zoneLow,

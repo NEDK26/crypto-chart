@@ -1,10 +1,10 @@
 
 > crypto-chart@0.0.0 dev
-> vite --host 0.0.0.0 --port 5173
+> vite --host 0.0.0.0 --port 6644
 
 
-  VITE v7.3.1  ready in 257 ms
+  VITE v7.3.1  ready in 137 ms
 
-  ➜  Local:   http://localhost:5173/
-  ➜  Network: http://10.147.17.53:5173/
-  ➜  Network: http://192.168.3.125:5173/
+  ➜  Local:   http://localhost:6644/
+  ➜  Network: http://10.147.17.53:6644/
+  ➜  Network: http://192.168.3.125:6644/

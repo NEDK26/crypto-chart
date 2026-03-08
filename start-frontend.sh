@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-5173}"
+PORT="${PORT:-6644}"
 PID_FILE="$ROOT_DIR/.frontend-dev.pid"
 LOG_FILE="$ROOT_DIR/nohup.out"
 

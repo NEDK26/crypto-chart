@@ -77,6 +77,8 @@
 ./start-dev.sh
 ```
 
+默认访问地址：`http://localhost:6644`
+
 也可以手动分别启动两个进程：
 
 ```bash
@@ -86,6 +88,8 @@ npm --prefix bot run dev:market
 # 终端2：启动前端
 npm run dev
 ```
+
+手动启动后前端地址：`http://localhost:6644`
 
 ## 5. 当前视觉规范
 

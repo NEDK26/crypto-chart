@@ -409,6 +409,18 @@ interface MarketClientCommand {
   interval: KlineInterval;
 }
 
+interface BinanceKlineStreamPayload {
+  E?: number;
+  k?: {
+    t: number;
+    o: string;
+    h: string;
+    l: string;
+    c: string;
+    v: string;
+  };
+}
+
 interface HoverCandleInfo {
   timestamp: number;
   open: number;
@@ -468,8 +480,12 @@ function buildLevelTagText(
   const distancePct = resolveLevelDistancePct(level, referencePrice);
   const rankText = `${sidePrefix}${level.rank ?? ''}`;
   const intervalSuffix = sourceIntervalLabel ? `(${sourceIntervalLabel})` : '';
+  const flipSuffix =
+    level.isFlipped && level.sourceType
+      ? ` ${level.sourceType === 'support' ? 'S→R' : 'R→S'}`
+      : '';
 
-  return `${rankText}${intervalSuffix} ${level.price.toFixed(2)} ${formatSignedDelta(
+  return `${rankText}${intervalSuffix}${flipSuffix} ${level.price.toFixed(2)} ${formatSignedDelta(
     distancePct
   )} x${level.touches}`;
 }
@@ -554,6 +570,7 @@ export default function QuantChartDashboard() {
   const candlesRef = useRef<Candle[]>([]);
   const lastHoverKeyRef = useRef<string | null>(null);
   const marketWsRef = useRef<WebSocket | null>(null);
+  const fallbackKlineWsRef = useRef<WebSocket | null>(null);
 
   const [chartReady, setChartReady] = useState(false);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -901,6 +918,10 @@ export default function QuantChartDashboard() {
       return `${protocol}//${window.location.host}${MARKET_WS_ENDPOINT}`;
     };
 
+    const buildFallbackKlineUrl = () => {
+      return `wss://data-stream.binance.vision/ws/${selectedSymbol.toLowerCase()}@kline_${selectedInterval}`;
+    };
+
     const subscribeCommand: MarketClientCommand = {
       type: 'subscribe',
       symbol: selectedSymbol,
@@ -912,6 +933,85 @@ export default function QuantChartDashboard() {
       symbol: selectedSymbol,
       interval: selectedInterval,
     };
+
+    let fallbackStartTimer: number | null = null;
+    let fallbackStarted = false;
+
+    const stopFallbackKlineStream = () => {
+      if (fallbackStartTimer !== null) {
+        window.clearTimeout(fallbackStartTimer);
+        fallbackStartTimer = null;
+      }
+
+      const socket = fallbackKlineWsRef.current;
+      if (socket && socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
+      }
+      fallbackKlineWsRef.current = null;
+      fallbackStarted = false;
+    };
+
+    const startFallbackKlineStream = () => {
+      if (fallbackStarted || !mounted) {
+        return;
+      }
+
+      fallbackStarted = true;
+      const socket = new WebSocket(buildFallbackKlineUrl());
+      fallbackKlineWsRef.current = socket;
+
+      socket.onmessage = (event) => {
+        let payload: BinanceKlineStreamPayload;
+
+        try {
+          payload = JSON.parse(event.data) as BinanceKlineStreamPayload;
+        } catch {
+          return;
+        }
+
+        if (!payload.k) {
+          return;
+        }
+
+        const candle: Candle = {
+          timestamp: payload.k.t,
+          open: Number.parseFloat(payload.k.o),
+          high: Number.parseFloat(payload.k.h),
+          low: Number.parseFloat(payload.k.l),
+          close: Number.parseFloat(payload.k.c),
+          volume: Number.parseFloat(payload.k.v),
+        };
+
+        if (
+          !Number.isFinite(candle.timestamp) ||
+          !Number.isFinite(candle.open) ||
+          !Number.isFinite(candle.high) ||
+          !Number.isFinite(candle.low) ||
+          !Number.isFinite(candle.close) ||
+          !Number.isFinite(candle.volume)
+        ) {
+          return;
+        }
+
+        chartRef.current?.updateData(candle);
+        setCandles((previous) => {
+          const next = upsertCandle(previous, candle, historyLimit);
+          candlesRef.current = next;
+          return next;
+        });
+        setCurrentPrice(candle.close);
+      };
+
+      socket.onclose = () => {
+        if (fallbackKlineWsRef.current === socket) {
+          fallbackKlineWsRef.current = null;
+        }
+      };
+    };
+
+    fallbackStartTimer = window.setTimeout(() => {
+      startFallbackKlineStream();
+    }, 4000);
 
     const connectMarketStream = () => {
       let reconnectTimer: number | null = null;
@@ -965,6 +1065,17 @@ export default function QuantChartDashboard() {
           if (message.type === 'error') {
             console.warn('Market service error:', message.payload.message);
             return;
+          }
+
+          if (message.type !== 'snapshot') {
+            if (fallbackStartTimer !== null) {
+              window.clearTimeout(fallbackStartTimer);
+              fallbackStartTimer = null;
+            }
+
+            if (fallbackKlineWsRef.current) {
+              stopFallbackKlineStream();
+            }
           }
 
           if (message.type === 'depth_update') {
@@ -1026,6 +1137,8 @@ export default function QuantChartDashboard() {
           window.clearTimeout(reconnectTimer);
           reconnectTimer = null;
         }
+
+        stopFallbackKlineStream();
 
         const activeSocket = marketWsRef.current;
         if (activeSocket && activeSocket.readyState === WebSocket.OPEN) {
@@ -1187,6 +1300,7 @@ export default function QuantChartDashboard() {
         LEVEL_ZONE_OPACITY_BY_TIER[tier] * (isHigherInterval ? 0.62 : 1) *
         (isNear ? 1.08 : 1);
       const lineOpacity = (isHigherInterval ? 0.58 : 0.92) + (isNear ? 0.06 : 0);
+      const isFlipped = Boolean(level.isFlipped);
 
       return {
         name: SUPPORT_ZONE_OVERLAY_NAME,
@@ -1226,8 +1340,8 @@ export default function QuantChartDashboard() {
           line: {
             color: toRgba(rgb, Math.min(lineOpacity, 0.96)),
             size: lineSize,
-            style: isHigherInterval ? LineType.Dashed : LineType.Solid,
-            dashedValue: isHigherInterval ? [6, 4] : [],
+            style: isHigherInterval || isFlipped ? LineType.Dashed : LineType.Solid,
+            dashedValue: isHigherInterval || isFlipped ? [6, 4] : [],
             smooth: false,
           },
           text: {
@@ -1325,13 +1439,19 @@ export default function QuantChartDashboard() {
                   tier === 'strong' ? '强' : tier === 'mid' ? '中' : '弱';
                 const distancePct = resolveLevelDistancePct(level, livePrice);
                 const isNear = Boolean(level.isNear) || Math.abs(distancePct) <= 0.25;
+                const flipLabel =
+                  level.isFlipped && level.sourceType
+                    ? level.sourceType === 'support'
+                      ? 'S→R'
+                      : 'R→S'
+                    : null;
 
                 return (
                   <div
                     key={level.id}
-                    className={`level-item ${level.type} ${tier} ${isNear ? 'near' : ''}`}
+                    className={`level-item ${level.type} ${tier} ${isNear ? 'near' : ''} ${level.isFlipped ? 'flipped' : ''}`}
                   >
-                    <span>{`${sidePrefix}${rank} · ${tierLabel}`}</span>
+                    <span>{`${sidePrefix}${rank} · ${tierLabel}${flipLabel ? ` · ${flipLabel}` : ''}`}</span>
                     <strong>{formatPrice(level.price)}</strong>
                     <small>{`${formatSignedDelta(distancePct)} · x${level.touches}`}</small>
                   </div>
